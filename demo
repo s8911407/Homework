@@ -1,0 +1,239 @@
+        public PaginatedResult<T> GetFlowList<T>(string QIID, string Status, int pageNumber = 1, int pageSize = 10, FlowDetailSearchParams searchParams = null)
+        {
+            if (string.IsNullOrEmpty(QIID))
+            {
+                Msg = "查無QIID";
+                return new PaginatedResult<T>();
+            }
+
+            searchParams?.SanitizeParams();
+
+            var whereConditions = new List<string>
+            {
+                "1=1"
+            };
+
+            if (searchParams != null)
+            {
+                if (searchParams.StartDate != default(DateTime))
+                    whereConditions.Add("otg.START_DATE = @StartDate");
+
+                if (!string.IsNullOrEmpty(searchParams.AgentId))
+                    whereConditions.Add("otg.AGENT_ID LIKE @AgentId + '%'");
+
+                if (!string.IsNullOrEmpty(searchParams.AgentName))
+                    whereConditions.Add("otg.AGENT_NAME LIKE '%' + @AgentName + '%'");
+
+                if (!string.IsNullOrEmpty(searchParams.CustomerId))
+                    whereConditions.Add("otg.CUSTOMER_ID LIKE @CustomerId + '%'");
+
+                if (!string.IsNullOrEmpty(searchParams.CallUUID))
+                    whereConditions.Add("otg.CallUUID LIKE @CallUUID + '%'");
+
+                if (!string.IsNullOrEmpty(searchParams.Group))
+                    whereConditions.Add("otg.[GROUP] = @Group");
+
+                if (!string.IsNullOrEmpty(searchParams.Unit))
+                    whereConditions.Add("otg.UNIT = @Unit");
+
+                if (!string.IsNullOrEmpty(searchParams.Plno))
+                    whereConditions.Add("otg.PLNO = @Plno");
+
+                if (!string.IsNullOrEmpty(searchParams.AgentDn))
+                    whereConditions.Add("otg.AGENT_DN = @AgentDn");
+
+                if (!string.IsNullOrEmpty(searchParams.HitRules))
+                    whereConditions.Add("hr.RuleName LIKE '%' +@HitRules + '%'");
+
+                if (!string.IsNullOrEmpty(searchParams.NotHitRules))
+                    whereConditions.Add("nhr.NotRuleName LIKE @NotHitRules + '%'");
+            }
+
+            string whereClause = string.Join(" AND ", whereConditions);
+
+            string sql = $@"
+        WITH AQTStatus AS (
+            SELECT CallUUID, 
+                CASE WHEN MIN(NoteStatus) = 0 THEN '0'
+                    WHEN MIN(NoteStatus) > 0 AND MAX(NoteStatus) = 2 THEN '2'
+                    WHEN MIN(NoteStatus) = 1 AND MAX(NoteStatus) = 1 THEN '1'
+                    ELSE ''
+                END AS AQTStatus
+            FROM AutomaticQITSV WITH(NOLOCK)
+            WHERE QIID = @QIID AND NoteType = '2'
+            GROUP BY CALLUUID
+        ),
+        QueryAQT AS (
+            SELECT aqt.*, AQTStatus.AQTStatus 
+            FROM AutomaticQITSV aqt WITH(NOLOCK)
+            LEFT JOIN AQTStatus ON (AQTStatus.AQTStatus = @Status OR @Status = '-1') AND aqt.CallUUID = AQTStatus.CallUUID
+            WHERE QIID = @QIID AND NoteType = '2' AND (AQTStatus.AQTStatus = @Status OR @Status = '-1')
+        ),
+        LatestModification AS (
+            SELECT 
+                CallUUID,
+                AQTStatus Status,
+                Memo,
+                ModEmpNo + ' ' + ModEmpName as ModEmp,
+                ModDate,
+                MailDate,
+                ROW_NUMBER() OVER (PARTITION BY CallUUID ORDER BY ModDate DESC) as rn
+            FROM QueryAQT
+        ),
+        HitRules AS (
+            SELECT 
+                CallUUID,
+                STRING_AGG(RuleName, ',') as RuleName
+            FROM QueryAQT
+            WHERE NoteStatus = '1'
+            GROUP BY CallUUID
+        ),
+        NotHitRules AS (
+            SELECT 
+                CallUUID,
+                STRING_AGG(RuleName, ',') as NotRuleName
+            FROM QueryAQT
+            WHERE NoteStatus = '0'
+            GROUP BY CallUUID
+        )
+        SELECT DISTINCT 
+            aq.QIID,
+            aq.FlowID,
+            aq.FlowName,
+            otg.CallUUID,
+            otg.START_DATE,
+            otg.START_TIME,
+            otg.END_TIME,
+            otg.AGENT_ID,
+            otg.AGENT_NAME,
+            otg.[GROUP],
+            otg.UNIT,
+            otg.AGENT_DN,
+            otg.CUSTOMER_ID,
+            otg.PLNO,
+            lm.Status,
+            lm.Memo,
+            lm.ModEmp,
+            lm.ModDate,
+            lm.MailDate,
+            ISNULL(hr.RuleName, '') RuleName,
+            ISNULL(nhr.NotRuleName, '') NotRuleName
+        FROM OnTheGoData otg WITH(NOLOCK)
+        LEFT JOIN QueryAQT aqt ON aqt.CallUUID = otg.CallUUID
+        INNER JOIN LatestModification lm 
+            ON otg.CallUUID = lm.CallUUID AND lm.rn = 1
+        INNER JOIN AutomaticQI aq WITH(NOLOCK) 
+            ON aq.QIID = @QIID
+        LEFT JOIN HitRules hr 
+            ON otg.CallUUID = hr.CallUUID
+        LEFT JOIN NotHitRules nhr 
+            ON otg.CallUUID = nhr.CallUUID
+        WHERE  aqt.QIID = @QIID AND (aqt.AQTStatus = @Status OR @Status = '-1') AND {whereClause}
+        ORDER BY otg.START_DATE, otg.START_TIME
+        OFFSET @Offset ROWS
+        FETCH NEXT @PageSize ROWS ONLY";
+
+            var parameters = new DynamicParameters();
+            parameters.Add("@QIID", QIID);
+            parameters.Add("@Status", Status);
+            parameters.Add("@Offset", (pageNumber - 1) * pageSize);
+            parameters.Add("@PageSize", pageSize);
+
+            if (searchParams != null)
+            {
+                if (searchParams.StartDate != default(DateTime))
+                    parameters.Add("@StartDate", searchParams.StartDate.ToString("yyyy-MM-dd"));
+
+                if (!string.IsNullOrEmpty(searchParams.AgentId))
+                    parameters.Add("@AgentId", searchParams.AgentId);
+
+                if (!string.IsNullOrEmpty(searchParams.AgentName))
+                    parameters.Add("@AgentName", searchParams.AgentName);
+
+                if (!string.IsNullOrEmpty(searchParams.CustomerId))
+                    parameters.Add("@CustomerId", searchParams.CustomerId);
+
+                if (!string.IsNullOrEmpty(searchParams.CallUUID))
+                    parameters.Add("@CallUUID", searchParams.CallUUID);
+
+                if (!string.IsNullOrEmpty(searchParams.Group))
+                    parameters.Add("@Group", searchParams.Group);
+
+                if (!string.IsNullOrEmpty(searchParams.Unit))
+                    parameters.Add("@Unit", searchParams.Unit);
+
+                if (!string.IsNullOrEmpty(searchParams.Plno))
+                    parameters.Add("@Plno", searchParams.Plno);
+
+                if (!string.IsNullOrEmpty(searchParams.AgentDn))
+                    parameters.Add("@AgentDn", searchParams.AgentDn);
+
+                if (!string.IsNullOrEmpty(searchParams.HitRules))
+                    parameters.Add("@HitRules", searchParams.HitRules);
+
+                if (!string.IsNullOrEmpty(searchParams.NotHitRules))
+                    parameters.Add("@NotHitRules", searchParams.NotHitRules);
+
+            }
+
+            try
+            {
+                string countSql = $@"
+            WITH AQTStatus AS (
+    SELECT CallUUID, 
+        CASE WHEN MIN(NoteStatus) = 0 THEN '0'
+            WHEN MIN(NoteStatus) > 0 AND MAX(NoteStatus) = 2 THEN '2'
+            WHEN MIN(NoteStatus) = 1 AND MAX(NoteStatus) = 1 THEN '1'
+            ELSE ''
+        END AS AQTStatus
+    FROM AutomaticQITSV WITH(NOLOCK)
+    WHERE QIID = @QIID AND NoteType = '2'
+    GROUP BY CALLUUID
+),
+QueryAQT AS (
+    SELECT aqt.*, AQTStatus.AQTStatus 
+    FROM AutomaticQITSV aqt WITH(NOLOCK)
+    LEFT JOIN AQTStatus ON (AQTStatus.AQTStatus = @Status OR @Status = '-1') AND aqt.CallUUID = AQTStatus.CallUUID
+    WHERE QIID = @QIID AND NoteType = '2' AND (AQTStatus.AQTStatus = @Status OR @Status = '-1')
+),
+HitRules AS (
+    SELECT 
+        CallUUID,
+        STRING_AGG(RuleName, ',') as RuleName
+    FROM QueryAQT
+    WHERE NoteStatus = '1'
+    GROUP BY CallUUID
+),
+NotHitRules AS (
+    SELECT 
+        CallUUID,
+        STRING_AGG(RuleName, ',') as NotRuleName
+    FROM QueryAQT
+    WHERE NoteStatus = '0'
+    GROUP BY CallUUID
+)
+SELECT count(distinct otg.CallUUID)
+FROM OnTheGoData otg WITH(NOLOCK)
+LEFT JOIN QueryAQT aqt ON aqt.CallUUID = otg.CallUUID
+LEFT JOIN HitRules hr  ON otg.CallUUID = hr.CallUUID
+LEFT JOIN NotHitRules nhr  ON otg.CallUUID = nhr.CallUUID
+WHERE QIID = @QIID AND (aqt.AQTStatus = @Status OR @Status = '-1') AND {whereClause}";
+
+                var totalCount = _databaseOperations.ExecuteScalar<int>(countSql, parameters);
+                var data = _databaseOperations.Query<T>(sql, parameters);
+
+                return new PaginatedResult<T>
+                {
+                    Data = data,
+                    TotalCount = totalCount,
+                    PageSize = pageSize,
+                    CurrentPage = pageNumber,
+                    TotalPages = (int)Math.Ceiling(totalCount / (double)pageSize)
+                };
+            }
+            catch (Exception ex)
+            {
+                Msg = ex.Message;
+                return new PaginatedResult<T>();
+            }
+        }
